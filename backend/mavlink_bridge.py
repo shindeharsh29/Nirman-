@@ -27,8 +27,7 @@ For a PHYSICAL drone via USB (skip SITL):
 import threading
 import time
 import logging
-import subprocess
-import os
+import socket
 from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +58,51 @@ drone_state = {
 state_lock = threading.Lock()
 mavlink_conn = None
 sitl_instance = None   # dronekit_sitl handle
+apm_clients = set()    # set of (ip, port) tuples that have sent us a packet
+apm_lock = threading.Lock()
+
+
+# ── UDP forwarder: SITL TCP → UDP:14550 for APM Planner ──────────────────────
+def udp_forwarder():
+    """
+    Opens a raw TCP connection to SITL (tcp:127.0.0.1:5760) and forwards
+    every MAVLink byte to APM Planner 2 on UDP:14550 (its listening port).
+    """
+    APM_HOST = "127.0.0.1"
+    APM_UDP_PORT = 14550   # APM Planner listens here for incoming MAVLink
+    SITL_HOST = "127.0.0.1"
+    SITL_TCP_PORT = 5760
+
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    log.info(f"UDP forwarder: will push MAVLink to APM Planner on {APM_HOST}:{APM_UDP_PORT}")
+    log.info("APM Planner 2 — just click CONNECT (leave port as 14550, UDP Host)")
+
+    # Wait for SITL to boot
+    time.sleep(5)
+
+    while True:
+        try:
+            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_sock.connect((SITL_HOST, SITL_TCP_PORT))
+            tcp_sock.settimeout(2.0)
+            log.info("UDP forwarder: pushing SITL → APM Planner UDP:14550")
+
+            while True:
+                try:
+                    chunk = tcp_sock.recv(4096)
+                    if not chunk:
+                        break
+                    udp_sock.sendto(chunk, (APM_HOST, APM_UDP_PORT))
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    log.error(f"UDP fwd loop: {e}")
+                    break
+
+            tcp_sock.close()
+        except Exception as e:
+            log.warning(f"UDP forwarder: {e}. Retrying in 5s ...")
+            time.sleep(5)
 
 
 # ── Start SITL & MAVLink reader ───────────────────────────────────────────────
@@ -244,8 +288,15 @@ def sitl_info():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    t = threading.Thread(target=start_sitl_and_connect, daemon=True, name="mavlink")
-    t.start()
-    log.info(f"Bridge REST API → http://0.0.0.0:{BRIDGE_PORT}")
-    log.info("InfraScan Admin → Incident Map will show live drone telemetry")
+    # 1. MAVLink reader (telemetry for InfraScan)
+    t1 = threading.Thread(target=start_sitl_and_connect, daemon=True, name="mavlink")
+    t1.start()
+
+    # 2. UDP forwarder (APM Planner 2 connection)
+    t2 = threading.Thread(target=udp_forwarder, daemon=True, name="udp-fwd")
+    t2.start()
+
+    log.info(f"Bridge REST API          → http://0.0.0.0:{BRIDGE_PORT}")
+    log.info(f"APM Planner 2 — connect  → UDP Host → 127.0.0.1:14550")
+    log.info("InfraScan Admin Map      → shows live drone telemetry")
     uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, log_level="warning")
