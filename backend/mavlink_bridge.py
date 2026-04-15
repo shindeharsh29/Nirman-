@@ -1,30 +1,34 @@
 """
-InfraScan MAVLink Bridge — backend/mavlink_bridge.py
-Runs on port 8001. Connects to ArduPilot SITL (or real drone) via MAVLink UDP.
+InfraScan MAVLink Bridge — with built-in dronekit-sitl
+Runs on port 8001.
 
-Start this AFTER starting your SITL or connecting your drone:
+Usage:
     cd backend && source venv/bin/activate
     python mavlink_bridge.py
 
-SITL Docker command (run first in a separate terminal):
-    docker run -it --rm -p 14550:14550/udp -p 14551:14551/udp \\
-      ardupilot/ardupilot-dev-ros \\
-      bash -c "cd /ardupilot && python Tools/autotest/sim_vehicle.py \\
-      -v ArduCopter \\
-      --out=udp:host.docker.internal:14550 \\
-      --out=udp:host.docker.internal:14551 --console"
+This script:
+1. Automatically starts a dronekit-sitl ArduCopter instance
+2. Connects to it via pymavlink
+3. Exposes REST API for InfraScan frontend:
+   GET  /telemetry   — live drone telemetry
+   POST /waypoint    — fly drone to lat/lng
+   POST /return-home — RTL
+   POST /land        — land drone
 
-APM Planner 2  → connects to UDP 127.0.0.1:14550
-This bridge      → connects to UDP 127.0.0.1:14551 (no conflict)
+APM Planner 2 connection:
+   Connect to TCP → 127.0.0.1:5760
+   (or MAVProxy bridges it to UDP:14550)
 
-For a PHYSICAL drone via USB:
-    Change CONNECTION_STRING = 'serial:/dev/tty.usbmodem1:57600'
+For a PHYSICAL drone via USB (skip SITL):
+   Set USE_SITL = False
+   Set SERIAL_PORT = '/dev/tty.usbmodem1'
 """
 
 import threading
 import time
-import math
 import logging
+import subprocess
+import os
 from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,73 +38,93 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [DRONE] %(message)s')
 log = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
-CONNECTION_STRING = "udpin:0.0.0.0:14551"   # SITL output on port 14551
-# CONNECTION_STRING = "serial:/dev/tty.usbmodem1:57600"  # Physical drone via USB
-BRIDGE_PORT       = 8001
-HOME_LAT          = 20.5937   # Default SITL home (India)
-HOME_LNG          = 78.9629
-HOME_ALT          = 10.0
+# ── Config ────────────────────────────────────────────────────────────────────
+USE_SITL    = True          # False = connect to real drone instead
+SERIAL_PORT = '/dev/tty.usbmodem1'   # used only if USE_SITL = False
+BAUD_RATE   = 57600
+BRIDGE_PORT = 8001
 
-# ── Shared state (updated by MAVLink reader thread) ─────────────────────────
+HOME_LAT = 19.0760   # Mumbai — change to your city
+HOME_LNG = 72.8777
+HOME_ALT = 584.0     # altitude above sea level (metres)
+
+# ── Shared telemetry state ────────────────────────────────────────────────────
 drone_state = {
-    "lat":     HOME_LAT,
-    "lng":     HOME_LNG,
-    "alt":     0.0,
-    "speed":   0.0,
-    "heading": 0.0,
-    "armed":   False,
-    "mode":    "UNKNOWN",
-    "battery": 100,
-    "connected": False,
-    "last_update": 0,
+    "lat": HOME_LAT, "lng": HOME_LNG, "alt": 0.0,
+    "speed": 0.0, "heading": 0.0, "armed": False,
+    "mode": "STABILIZE", "battery": 100,
+    "connected": False, "stale": True, "last_update": 0,
+    "sitl_port": None,
 }
 state_lock = threading.Lock()
-mavlink_conn = None   # global MAVLink connection object
+mavlink_conn = None
+sitl_instance = None   # dronekit_sitl handle
 
 
-# ── MAVLink reader thread ────────────────────────────────────────────────────
-def mavlink_reader():
-    global mavlink_conn
+# ── Start SITL & MAVLink reader ───────────────────────────────────────────────
+def start_sitl_and_connect():
+    global mavlink_conn, sitl_instance
     from pymavlink import mavutil
 
-    log.info(f"Connecting to {CONNECTION_STRING} ...")
+    if USE_SITL:
+        try:
+            import dronekit_sitl
+            log.info("Starting dronekit-sitl ArduCopter ...")
+            sitl_instance = dronekit_sitl.start_default()
+            connection_string = sitl_instance.connection_string()
+            with state_lock:
+                drone_state["sitl_port"] = connection_string
+            log.info(f"SITL started → {connection_string}")
+            log.info("✅ Connect APM Planner 2 to: TCP → 127.0.0.1:5760")
+        except Exception as e:
+            log.error(f"SITL start failed: {e}")
+            return
+    else:
+        connection_string = f"serial:{SERIAL_PORT}:{BAUD_RATE}"
+        log.info(f"Physical drone mode → {connection_string}")
+
+    # Loop: connect and read MAVLink
     while True:
         try:
-            mavlink_conn = mavutil.mavlink_connection(CONNECTION_STRING)
-            log.info("Waiting for MAVLink heartbeat ...")
+            log.info(f"Connecting to {connection_string} ...")
+            mavlink_conn = mavutil.mavlink_connection(connection_string)
+            log.info("Waiting for heartbeat ...")
             mavlink_conn.wait_heartbeat(timeout=30)
-            log.info(f"Heartbeat received! System {mavlink_conn.target_system} Component {mavlink_conn.target_component}")
+            log.info(f"✅ Heartbeat! System {mavlink_conn.target_system}")
             with state_lock:
                 drone_state["connected"] = True
+                drone_state["stale"] = False
 
             while True:
                 msg = mavlink_conn.recv_match(
-                    type=['GLOBAL_POSITION_INT', 'HEARTBEAT', 'VFR_HUD',
-                          'SYS_STATUS', 'BATTERY_STATUS'],
+                    type=['GLOBAL_POSITION_INT', 'HEARTBEAT', 'VFR_HUD', 'BATTERY_STATUS'],
                     blocking=True, timeout=5
                 )
-                if msg is None:
+                if not msg:
                     continue
 
-                mtype = msg.get_type()
+                mt = msg.get_type()
                 with state_lock:
-                    if mtype == 'GLOBAL_POSITION_INT':
+                    if mt == 'GLOBAL_POSITION_INT':
                         drone_state["lat"]     = msg.lat / 1e7
                         drone_state["lng"]     = msg.lon / 1e7
                         drone_state["alt"]     = round(msg.relative_alt / 1000.0, 1)
                         drone_state["heading"] = msg.hdg / 100.0 if msg.hdg != 65535 else drone_state["heading"]
                         drone_state["last_update"] = time.time()
+                        drone_state["stale"]   = False
 
-                    elif mtype == 'VFR_HUD':
+                    elif mt == 'VFR_HUD':
                         drone_state["speed"] = round(msg.groundspeed, 1)
 
-                    elif mtype == 'HEARTBEAT':
+                    elif mt == 'HEARTBEAT':
                         from pymavlink import mavutil as mu
                         drone_state["armed"] = bool(msg.base_mode & mu.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                        drone_state["mode"]  = mavlink_conn.flightmode or "UNKNOWN"
+                        try:
+                            drone_state["mode"] = mavlink_conn.flightmode or "UNKNOWN"
+                        except Exception:
+                            pass
 
-                    elif mtype == 'BATTERY_STATUS':
+                    elif mt == 'BATTERY_STATUS':
                         if msg.battery_remaining >= 0:
                             drone_state["battery"] = msg.battery_remaining
 
@@ -108,85 +132,74 @@ def mavlink_reader():
             log.error(f"MAVLink error: {e}. Reconnecting in 5s ...")
             with state_lock:
                 drone_state["connected"] = False
+                drone_state["stale"] = True
             mavlink_conn = None
             time.sleep(5)
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────────
+# ── FastAPI REST API ──────────────────────────────────────────────────────────
 app = FastAPI(title="InfraScan MAVLink Bridge", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/")
 def root():
-    return {"service": "InfraScan MAVLink Bridge", "port": BRIDGE_PORT}
+    return {"service": "InfraScan MAVLink Bridge", "port": BRIDGE_PORT, "use_sitl": USE_SITL}
 
 
 @app.get("/telemetry")
 def get_telemetry():
-    """Return latest drone telemetry snapshot."""
     with state_lock:
         snap = dict(drone_state)
-    stale = (time.time() - snap["last_update"]) > 10 if snap["last_update"] else True
-    snap["stale"] = stale
+    if snap["last_update"]:
+        snap["stale"] = (time.time() - snap["last_update"]) > 10
     return snap
 
 
 class WaypointRequest(BaseModel):
     lat: float
     lng: float
-    alt: float = 30.0   # default mission altitude in metres
+    alt: float = 30.0
 
 
 @app.post("/waypoint")
 def send_waypoint(wp: WaypointRequest):
-    """Arm drone, switch to GUIDED mode, fly to waypoint."""
     global mavlink_conn
     if mavlink_conn is None:
         return {"success": False, "error": "Drone not connected"}
-
     try:
         from pymavlink import mavutil
 
-        # 1. Switch to GUIDED
         mavlink_conn.set_mode("GUIDED")
         time.sleep(0.5)
 
-        # 2. Arm if disarmed
         with state_lock:
             is_armed = drone_state["armed"]
+            current_alt = drone_state["alt"]
+
         if not is_armed:
             mavlink_conn.arducopter_arm()
-            log.info("Arming drone ...")
+            log.info("Arming ...")
             time.sleep(2)
 
-        # 3. Send TAKEOFF command if on ground (alt == 0)
-        with state_lock:
-            current_alt = drone_state["alt"]
         if current_alt < 2.0:
             mavlink_conn.mav.command_long_send(
-                mavlink_conn.target_system,
-                mavlink_conn.target_component,
+                mavlink_conn.target_system, mavlink_conn.target_component,
                 mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
                 0, 0, 0, 0, 0, 0, 0, wp.alt
             )
             log.info(f"Taking off to {wp.alt}m ...")
-            time.sleep(3)
+            time.sleep(4)
 
-        # 4. Send GUIDED waypoint
         mavlink_conn.mav.mission_item_send(
-            mavlink_conn.target_system,
-            mavlink_conn.target_component,
-            0,                                        # sequence
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavlink_conn.target_system, mavlink_conn.target_component,
+            0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
             mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            2, 1,                                     # current=2 (guided), autocontinue
-            0, 0, 0, 0,                               # params 1–4
+            2, 1, 0, 0, 0, 0,
             wp.lat, wp.lng, wp.alt
         )
-        log.info(f"Waypoint sent → lat={wp.lat}, lng={wp.lng}, alt={wp.alt}m")
-        return {"success": True, "waypoint": {"lat": wp.lat, "lng": wp.lng, "alt": wp.alt}}
-
+        log.info(f"✅ Waypoint → lat={wp.lat}, lng={wp.lng}, alt={wp.alt}m")
+        return {"success": True, "waypoint": wp.dict()}
     except Exception as e:
         log.error(f"Waypoint error: {e}")
         return {"success": False, "error": str(e)}
@@ -194,33 +207,45 @@ def send_waypoint(wp: WaypointRequest):
 
 @app.post("/return-home")
 def return_to_launch():
-    """Send RTL command."""
     global mavlink_conn
-    if mavlink_conn is None:
-        return {"success": False, "error": "Drone not connected"}
+    if not mavlink_conn:
+        return {"success": False, "error": "Not connected"}
     try:
         mavlink_conn.set_mode("RTL")
-        return {"success": True, "action": "RTL commanded"}
+        return {"success": True, "action": "RTL"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @app.post("/land")
-def land_drone():
+def land():
     global mavlink_conn
-    if mavlink_conn is None:
-        return {"success": False, "error": "Drone not connected"}
+    if not mavlink_conn:
+        return {"success": False, "error": "Not connected"}
     try:
         mavlink_conn.set_mode("LAND")
-        return {"success": True, "action": "LAND commanded"}
+        return {"success": True, "action": "LAND"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+@app.get("/sitl-info")
+def sitl_info():
+    """Return SITL connection info for APM Planner 2."""
+    with state_lock:
+        port = drone_state.get("sitl_port")
+    return {
+        "sitl_active": USE_SITL,
+        "connection_string": port,
+        "apm_planner_connect": "TCP → 127.0.0.1:5760",
+        "bridge_api": f"http://localhost:{BRIDGE_PORT}",
+    }
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Start MAVLink reader in background thread
-    reader = threading.Thread(target=mavlink_reader, daemon=True, name="mavlink-reader")
-    reader.start()
-    log.info(f"Bridge REST API starting on http://0.0.0.0:{BRIDGE_PORT}")
+    t = threading.Thread(target=start_sitl_and_connect, daemon=True, name="mavlink")
+    t.start()
+    log.info(f"Bridge REST API → http://0.0.0.0:{BRIDGE_PORT}")
+    log.info("InfraScan Admin → Incident Map will show live drone telemetry")
     uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, log_level="warning")
