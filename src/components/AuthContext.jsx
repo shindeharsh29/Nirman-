@@ -36,8 +36,11 @@ export const AuthProvider = ({ children }) => {
     formData.append('username', email); // OAuth2 expects username field
     formData.append('password', password);
     const response = await axios.post('http://localhost:8000/api/auth/login', formData);
-    localStorage.setItem('token', response.data.access_token);
-    setToken(response.data.access_token);
+    const newToken = response.data.access_token;
+    localStorage.setItem('token', newToken);
+    axios.defaults.headers.common['Authorization'] = `Bearer ${newToken}`;
+    setToken(newToken);
+    await fetchUser();
   };
 
   const register = async (username, email, password) => {
